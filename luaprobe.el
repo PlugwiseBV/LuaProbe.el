@@ -541,11 +541,33 @@ Signals if the install dir is missing or incomplete."
     (user-error "LuaProbe is not installed; run M-x luaprobe-install"))
   (expand-file-name "bin/luaprobe" luaprobe-install-dir))
 
+(defun luaprobe--cleanup-session ()
+  "Tear down any previous session, ready for a fresh launch.
+Kills the `*luaprobe*' comint buffer, the `*luaprobe-locals*'
+side buffer, and removes the paused-line overlay."
+  (let ((kill-buffer-query-functions nil))
+    (when (and luaprobe--session-buffer
+               (buffer-live-p luaprobe--session-buffer))
+      (let ((proc (get-buffer-process luaprobe--session-buffer)))
+        (when (process-live-p proc)
+          (set-process-query-on-exit-flag proc nil)))
+      (kill-buffer luaprobe--session-buffer))
+    (setq luaprobe--session-buffer nil)
+    (when (get-buffer "*luaprobe-locals*")
+      (kill-buffer "*luaprobe-locals*")))
+  (luaprobe--clear-paused-overlay))
+
 ;;;###autoload
 (defun luaprobe-launch (target &optional args)
-  "Run TARGET (a Lua file) under LuaProbe in a comint buffer.
+  "Run TARGET (a Lua file) under LuaProbe.
 ARGS is a string of extra CLI args passed to the target.
-Interactively, defaults TARGET to the current buffer's file."
+Interactively, defaults TARGET to the current buffer's file.
+
+The `*luaprobe*' comint buffer is created but kept hidden — all
+debugger state surfaces in the `*luaprobe-locals*' side window
+that pops up when the target pauses.  Use
+`\\[luaprobe-show-session]' (`o' in the locals buffer) if you ever
+need raw access to the bin/luaprobe REPL."
   (interactive
    (list (read-file-name "Lua file: " nil
                          (and buffer-file-name buffer-file-name)
@@ -563,19 +585,28 @@ Interactively, defaults TARGET to the current buffer's file."
                    (and args (not (string-empty-p args))
                         (split-string-and-unquote args))))
          (buf-name "*luaprobe*"))
-    (when (and luaprobe--session-buffer
-               (buffer-live-p luaprobe--session-buffer)
-               (get-buffer-process luaprobe--session-buffer))
-      (when (yes-or-no-p "A luaprobe session is already running — kill it? ")
-        (let ((kill-buffer-query-functions nil))
-          (kill-buffer luaprobe--session-buffer))))
+    (luaprobe--cleanup-session)
     (let ((default-directory target-dir))
       (setq luaprobe--session-buffer
             (apply #'make-comint-in-buffer "luaprobe" buf-name
                    bin nil argv)))
     (with-current-buffer luaprobe--session-buffer
       (luaprobe-comint-mode))
-    (display-buffer luaprobe--session-buffer)))
+    (message "luaprobe: launched %s (output is hidden; press `o' in *luaprobe-locals* to show it)"
+             (file-name-nondirectory target))))
+
+(defun luaprobe-show-session ()
+  "Pop up the hidden `*luaprobe*' comint buffer.
+Useful when you want to drive bin/luaprobe directly — type `p NAME'
+to deep-inspect a variable, `e EXPR' to evaluate, `bps' to list
+breakpoints, etc.  Bury the buffer again with `q'."
+  (interactive)
+  (unless (and luaprobe--session-buffer
+               (buffer-live-p luaprobe--session-buffer))
+    (user-error "No luaprobe session running"))
+  (display-buffer luaprobe--session-buffer
+                  '((display-buffer-reuse-window
+                     display-buffer-pop-up-window))))
 
 (defun luaprobe--push-points-to-running-session ()
   "Push the persisted point list to the live LuaProbe session, if any.
@@ -792,6 +823,7 @@ commands run in that frame."
     (define-key m (kbd "s")       #'luaprobe-locals-step)
     (define-key m (kbd "N")       #'luaprobe-locals-next)
     (define-key m (kbd "f")       #'luaprobe-locals-finish)
+    (define-key m (kbd "o")       #'luaprobe-show-session)
     (define-key m (kbd "?")       #'luaprobe-help)
     (define-key m (kbd "q")       #'quit-window)
     (define-key m [mouse-1]       #'luaprobe-locals-mouse-jump)
@@ -839,22 +871,33 @@ KEY is the keyboard letter, LABEL the caption, CMD the command."
         (erase-buffer)
         ;; Pause banner.
         (insert (propertize
-                 (format "PAUSED  %s:%d  [%s]  (%s)"
+                 (format "PAUSED  %s:%d  (%s)"
                          (or (and (plist-get event :file)
                                   (file-name-nondirectory
                                    (plist-get event :file)))
                              "?")
                          (or (plist-get event :line) 0)
-                         (or (plist-get event :thread) "?")
                          (or (plist-get event :reason) "?"))
                  'face 'luaprobe-locals-header-face))
         (insert "\n")
+        ;; Thread / coroutine section.
+        (let ((thread (plist-get event :thread)))
+          (cond
+           ((and thread (string= thread "main"))
+            (insert (propertize "  thread:    main" 'face 'shadow) "\n"))
+           (thread
+            (insert (propertize "  thread:    " 'face 'shadow)
+                    (propertize (concat "coroutine " thread)
+                                'face 'luaprobe-locals-section-face)
+                    "\n"))))
         (when (plist-get event :created-src)
-          (insert (propertize
-                   (format "  coroutine created at %s:%d\n"
+          (insert (propertize "  created:   " 'face 'shadow)
+                  (propertize
+                   (format "%s:%d"
                            (plist-get event :created-src)
                            (plist-get event :created-line))
-                   'face 'luaprobe-locals-section-face)))
+                   'face 'luaprobe-locals-section-face)
+                  "\n"))
         (insert "\n")
         ;; Frames.
         (insert (propertize "frames" 'face 'luaprobe-locals-section-face)
@@ -982,11 +1025,16 @@ In any luaprobe-mode buffer (your Lua source files):
   C-c d ?      Show this help
 
 Sessions:
-  M-x luaprobe-install   One-time clone of the LuaProbe repo
-  M-x luaprobe-launch    Run a Lua file under the debugger; opens a
-                         *luaprobe* comint buffer.
+  M-x luaprobe-install        One-time clone of the LuaProbe repo
+  M-x luaprobe-launch         Run a Lua file under the debugger
+  M-x luaprobe-show-session   Pop up the (hidden) *luaprobe* REPL
 
-Inside *luaprobe* (the (luaprobe) prompt is from bin/luaprobe):
+When the target pauses, *luaprobe-locals* opens on the right with
+the toolbar [c] cont [s] step [N] next [f] finish.  RET / TAB on a
+frame jumps the source window AND selects that frame in the
+debugger so the next `locals'/`p'/`e' commands run there.
+
+Inside *luaprobe* (only opened on demand via `o' / M-x luaprobe-show-session):
   c   continue                 b FILE:L     add breakpoint
   s   step into                d FILE:L     delete breakpoint
   n   step over                bps          list breakpoints
@@ -1032,6 +1080,7 @@ to LuaProbe spec format on launch (FILE:LINE[!] [if EXPR]).
     (define-key p (kbd "C") #'luaprobe-clear-all)
     ;; Sessions.
     (define-key p (kbd "r") #'luaprobe-launch)
+    (define-key p (kbd "o") #'luaprobe-show-session)
     (define-key p (kbd "I") #'luaprobe-install)
     ;; Help.
     (define-key p (kbd "?") #'luaprobe-help)

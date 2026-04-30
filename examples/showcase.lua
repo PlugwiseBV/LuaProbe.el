@@ -9,35 +9,45 @@
 --
 --   ~/.local/share/luaprobe/bin/luaprobe -i lua5.1 examples/showcase.lua
 --
--- Each section below has a `-- ★bpN' anchor on the line where you
--- should set a breakpoint.  Anchors are searchable (`C-s ★bp1') so
--- they keep working even if the file shifts around.
+-- This file pairs with examples/showcase_helpers.lua.  The tour
+-- exercises CROSS-FILE jumping: a breakpoint inside the helpers'
+-- `producer` / `consumer` coroutines pauses there; clicking the
+-- caller frame in *luaprobe-locals* jumps Emacs back to this file.
 --
--- In Emacs, place point on a ★ line and:
+-- Each section has a `-- ★bpN' anchor on the line where you should
+-- set a breakpoint.  In Emacs, place point on a ★ line and:
 --   C-c d b           plain breakpoint
 --   C-u C-c d b       conditional breakpoint (prompts)
 --   C-c d L           log-only breakpoint
+--   C-c d ?           full key map
 --
--- At the (luaprobe) prompt:
---
---   c / s / n / f      continue / step into / step over / finish
---   bt                 backtrace (full stack)
---   locals             current frame's locals + upvalues
---   p NAME             deep-inspect a local or upvalue
---   e EXPR             evaluate an expression in scope
---   frame N            switch to frame N
---   q                  quit (kills the target)
+-- When the target pauses, the *luaprobe-locals* side window opens
+-- on the right with a toolbar:
+--   c / s / N / f      continue / step into / step over / finish
+--   RET on a frame     jump source to that frame AND select it
+--                      in the debugger (so locals/upvalues update)
+--   o                  pop up the hidden *luaprobe* REPL for `p`,
+--                      `e`, `bt', etc.
+--   q                  hide the locals window
+
+-- Set up package.path so we can require the helpers file from the
+-- same directory regardless of where the script was launched from.
+local script_dir = (arg[0] or ""):match("^(.*/)") or "./"
+package.path = script_dir .. "?.lua;" .. package.path
+
+local helpers = require("showcase_helpers")
 
 -- ===========================================================
 -- SECTION 1 — locals, upvalues, and `e EXPR`
 -- ===========================================================
 -- `PI` and `seen` become upvalues of the closures defined below.
 -- Set a STOP bp on ★bp1.  When it fires:
---   • `locals`  → `name`, `message`
---   • You'll see `PI`, `seen`, `add` etc. as upvalues
---   • `e PI * 2`           prints 6.28318
---   • `e #seen`            prints how many times greet has run
---   • `p seen`             deep-dumps the visited table
+--   • *luaprobe-locals* shows: `name`, `message` under locals,
+--     `PI`, `seen`, `add`, `helpers' under upvalues
+--   • Press `o' to pop the REPL, then:
+--     `e PI * 2`        prints 6.28318
+--     `e #seen`         prints how many times greet has run
+--     `p seen`          deep-dumps the visited table
 
 local PI   = 3.14159
 local seen = {}
@@ -59,8 +69,9 @@ end
 -- ===========================================================
 -- Set a plain bp on ★bp2 (inside `outer`).  When it hits:
 --   • `s` steps into `middle`  → then into `inner` → then `add`
---   • Try again, but use `n` instead of `s` at ★bp2.  `middle`
---     runs to completion without dropping you into its body.
+--   • Try again, but use `N` (capital) instead of `s` at ★bp2.
+--     `middle` runs to completion without dropping you into its
+--     body.
 --   • Now set a bp on ★bp3 (inside `inner`).  When it fires,
 --     `f` resumes execution and pauses again on the line in
 --     `outer` right after `inner` returns.
@@ -84,8 +95,7 @@ end
 -- The Emacs side renders it inline above the source as
 --   ╎ IF i == 7
 -- Run.  The breakpoint fires exactly once: when the outer
--- counter reaches 7.  At the prompt, `e i, j, sum` shows all
--- three values.
+-- counter reaches 7.  Pop the REPL with `o', then `e i, j, sum'.
 
 local function sum_of_products(limit)
   local sum = 0
@@ -114,63 +124,29 @@ local function trace_sequence(start, n)
 end
 
 -- ===========================================================
--- SECTION 5 — coroutines
+-- SECTION 5 — coroutines (cross-file jumps)
 -- ===========================================================
--- Two coroutines that talk to each other.  `producer` yields
--- integers 1..n; `consumer` resumes it, squares each value, and
--- yields the square.  `pump' drives both from the main thread.
+-- The producer / consumer / pump bodies live in showcase_helpers.lua.
+-- Set a bp on ★bp6 in THAT file (open showcase_helpers.lua, place
+-- point on the `coroutine.yield(i)' line, C-c d b).
 --
--- Try:
---   1.  Set a stop bp on ★bp6 (inside `producer`).  When it
---       fires, `bt` shows you're in a coroutine — the stack is
---       just `producer` + the coroutine root, NOT the main
---       chain.
---   2.  Now set a bp on ★bp7 (inside `consumer`).  Same — the
---       stack is the consumer's frame chain, separate again.
---   3.  Add a CONDITIONAL bp at ★bp6: `if i == 4`.  Only the
---       4th yield triggers it.
-
-local function producer(n)
-  for i = 1, n do
-    coroutine.yield(i)                             -- ★bp6
-  end
-end
-
-local function consumer(prod_co)
-  while true do
-    local ok, x = coroutine.resume(prod_co)
-    if not ok or x == nil then break end
-    coroutine.yield(x * x)                         -- ★bp7
-  end
-end
-
-local function pump(_, cons_co)
-  local out = {}
-  while true do
-    local ok, sq = coroutine.resume(cons_co)
-    if not ok or sq == nil then break end
-    out[#out + 1] = sq
-  end
-  return out
-end
+-- When it fires:
+--   • The PAUSED line shows `thread: coroutine co:XXX' plus
+--     `created: showcase.lua:LINE' — the line below where we
+--     called coroutine.create.
+--   • Frame #1 is in showcase_helpers.lua; frame #2 is in this
+--     file (the call site).  Press RET on frame #2 → Emacs
+--     jumps across files AND the locals view updates to show
+--     this frame's variables.
 
 -- ===========================================================
 -- SECTION 6 — closures + per-instance upvalues
 -- ===========================================================
--- `make_counter` returns a function that closes over `count'.
--- Each returned counter has its OWN `count` upvalue.  Set a bp
--- on ★bp8 and inspect upvalues: `count` here is the value of
--- THIS counter, not the one created earlier.  Try `bt` and
--- `frame 2` to see who called this counter — the call site in
--- main has the local you'd expect (`c1` or `c2`).
-
-local function make_counter(start)
-  local count = start
-  return function(step)
-    count = count + (step or 1)                    -- ★bp8
-    return count
-  end
-end
+-- See showcase_helpers.lua's `make_counter' (★bp8).  When the bp
+-- fires, the same source-line is hit twice — once for c1, once
+-- for c2 — but the upvalue `count' is different each time
+-- because each closure has its own.  After RET on frame #2,
+-- Emacs jumps back here to the call site.
 
 -- ===========================================================
 -- main
@@ -189,15 +165,15 @@ print("sum_of_products(10) =", sum_of_products(10))
 print("\n=== Section 4: log-only bp ===")
 print("trace_sequence(1, 6) =", trace_sequence(1, 6))
 
-print("\n=== Section 5: coroutines ===")
-local prod = coroutine.create(function() producer(5) end)
-local cons = coroutine.create(function() consumer(prod) end)
-local squares = pump(prod, cons)
+print("\n=== Section 5: coroutines (cross-file) ===")
+local prod = coroutine.create(function() helpers.producer(5) end)
+local cons = coroutine.create(function() helpers.consumer(prod) end)
+local squares = helpers.pump(prod, cons)
 print("squares =", table.concat(squares, ", "))
 
-print("\n=== Section 6: closures ===")
-local c1 = make_counter(0)
-local c2 = make_counter(100)
+print("\n=== Section 6: closures (cross-file) ===")
+local c1 = helpers.make_counter(0)
+local c2 = helpers.make_counter(100)
 print("c1: ", c1(), c1(), c1())            -- 1, 2, 3
 print("c2: ", c2(2), c2(2), c2(2))         -- 102, 104, 106
 
