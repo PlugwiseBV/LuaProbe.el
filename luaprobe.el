@@ -121,6 +121,36 @@ Each is passed as `-s DIR' to bin/luaprobe."
        :foreground "DeepSkyBlue"))
   "Face for the inline condition / log-spec line above a point.")
 
+(defface luaprobe-locals-header-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face for the PAUSED header in the *luaprobe-locals* buffer.")
+
+(defface luaprobe-locals-section-face
+  '((t :inherit font-lock-type-face :weight bold))
+  "Face for `frames' / `locals' / `upvalues' / `entry' section labels.")
+
+(defface luaprobe-locals-frame-face
+  '((t :inherit font-lock-function-name-face))
+  "Face for stack frame entries in the *luaprobe-locals* buffer.")
+
+(defface luaprobe-locals-name-face
+  '((t :inherit font-lock-variable-name-face))
+  "Face for variable names in the *luaprobe-locals* buffer.")
+
+(defface luaprobe-locals-current-face
+  '((t :inherit font-lock-function-name-face :weight bold
+       :underline t))
+  "Face for the currently-selected frame in the *luaprobe-locals* buffer.")
+
+(defface luaprobe-locals-button-face
+  '((t :inherit mode-line-emphasis :weight bold
+       :box (:line-width 1 :style released-button)))
+  "Face for header-line toolbar buttons in *luaprobe-locals*.")
+
+(defcustom luaprobe-locals-window-width 60
+  "Width in columns of the *luaprobe-locals* side window."
+  :type 'integer)
+
 ;; Fringe bitmaps.
 (when (fboundp 'define-fringe-bitmap)
   (define-fringe-bitmap 'luaprobe-bp-fringe
@@ -566,22 +596,312 @@ buffer-local cache to only send diffs."
 (defvar luaprobe-comint-prompt-regexp "^(luaprobe) "
   "Prompt regexp emitted by bin/luaprobe.")
 
-(defvar luaprobe--break-line-regexp
-  "^\\*\\*\\* BREAK at \\(.+?\\):\\([0-9]+\\)"
-  "Regexp matching bin/luaprobe's pause banner.
-Group 1 is the source path; group 2 is the line number.")
+;; ----- output accumulator + parser ------------------------------------
+;;
+;; bin/luaprobe prints break events as a fixed-shape text block:
+;;
+;;   *** BREAK at FILE:LINE  [thread]  (reason=stop)
+;;   [    coroutine created at FILE:LINE]    (optional, indented 4 sp.)
+;;   * #1  NAME                       FILE:LINE      (frames; * = current)
+;;     #2  …
+;;
+;;   locals:                                          (any of these may
+;;     name = value                                    be absent)
+;;   upvalues:
+;;     name = value
+;;   entry (values at function entry):
+;;     name = value
+;;   (luaprobe)
+;;
+;; We keep a buffer-local accumulator of comint stdout, and whenever
+;; we see a `*** BREAK' followed by the next `(luaprobe)' prompt, we
+;; parse the chunk into a plist and re-render *luaprobe-locals*.
+
+(defvar-local luaprobe--accum ""
+  "Comint output accumulator for the *luaprobe* buffer.")
 
 (defun luaprobe--comint-output-filter (output)
-  "Comint output filter: scan OUTPUT for `*** BREAK' lines and jump.
+  "Comint preoutput filter: detect break events in OUTPUT.
 Always returns OUTPUT unchanged."
-  (when (and luaprobe-jump-on-pause
-             (stringp output)
-             (string-match luaprobe--break-line-regexp output))
-    (let ((file (match-string 1 output))
-          (line (string-to-number (match-string 2 output))))
-      (when (and file (> line 0))
-        (run-at-time 0 nil #'luaprobe--show-paused file line))))
+  (when (stringp output)
+    (setq luaprobe--accum (concat luaprobe--accum output))
+    ;; Process every complete `*** BREAK ... (luaprobe)' block in the
+    ;; accumulator; advance past each one as we consume it.
+    (let (continue)
+      (setq continue t)
+      (while continue
+        (setq continue nil)
+        (let ((break-start (string-match "^\\*\\*\\* BREAK at "
+                                         luaprobe--accum)))
+          (when break-start
+            (let ((prompt-pos (string-match "^(luaprobe) "
+                                            luaprobe--accum break-start)))
+              (when prompt-pos
+                (let* ((chunk (substring luaprobe--accum
+                                         break-start prompt-pos))
+                       (event (luaprobe--parse-break chunk)))
+                  (when event
+                    (run-at-time 0 nil #'luaprobe--render-break event)
+                    (when luaprobe-jump-on-pause
+                      (run-at-time
+                       0 nil #'luaprobe--show-paused
+                       (plist-get event :file)
+                       (plist-get event :line)))))
+                (setq luaprobe--accum
+                      (substring luaprobe--accum prompt-pos))
+                (setq continue t)))))))
+    ;; Keep the accumulator bounded.
+    (when (> (length luaprobe--accum) 65536)
+      (setq luaprobe--accum (substring luaprobe--accum -32768))))
   output)
+
+(defun luaprobe--parse-break (text)
+  "Parse a *** BREAK ... block TEXT into a plist."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (let (event frames)
+      (when (re-search-forward
+             (concat "^\\*\\*\\* BREAK at \\(.+?\\):\\([0-9]+\\)"
+                     "  \\[\\(.+?\\)\\]"
+                     "  (reason=\\(.+?\\))$")
+             nil t)
+        (setq event (list :file   (match-string 1)
+                          :line   (string-to-number (match-string 2))
+                          :thread (match-string 3)
+                          :reason (match-string 4))))
+      (goto-char (point-min))
+      (when (re-search-forward
+             "^    coroutine created at \\(.+?\\):\\([0-9]+\\)" nil t)
+        (setq event (plist-put event :created-src  (match-string 1)))
+        (setq event (plist-put event :created-line
+                               (string-to-number (match-string 2)))))
+      (goto-char (point-min))
+      (while (re-search-forward
+              (concat "^\\([* ]\\) #\\([0-9]+\\)  "
+                      "\\(.+?\\)  +"
+                      "\\(.+?\\):\\(-?[0-9]+\\)\\s-*$")
+              nil t)
+        (push (list :idx     (string-to-number (match-string 2))
+                    :name    (string-trim (match-string 3))
+                    :file    (match-string 4)
+                    :line    (string-to-number (match-string 5))
+                    :current (string= (match-string 1) "*"))
+              frames))
+      (when event (setq event (plist-put event :frames (nreverse frames))))
+      ;; Sections.
+      (dolist (kv '((:locals   . "^locals:$")
+                    (:upvalues . "^upvalues:$")
+                    (:entry    . "^entry[^:]*:$")))
+        (goto-char (point-min))
+        (when (re-search-forward (cdr kv) nil t)
+          (forward-line 1)
+          (let (vars)
+            (while (looking-at "^  \\(.+?\\) = \\(.*\\)$")
+              (push (list :name (match-string 1)
+                          :value (match-string 2))
+                    vars)
+              (forward-line 1))
+            (when event
+              (setq event (plist-put event (car kv) (nreverse vars)))))))
+      event)))
+
+;; ----- *luaprobe-locals* buffer ---------------------------------------
+
+(defvar-local luaprobe--current-event nil
+  "Last parsed break event rendered in this buffer.")
+
+(defun luaprobe--send (cmd)
+  "Send CMD as a line to the running *luaprobe* comint process."
+  (let ((proc (and (bufferp luaprobe--session-buffer)
+                   (buffer-live-p luaprobe--session-buffer)
+                   (get-buffer-process luaprobe--session-buffer))))
+    (cond
+     ((not (and proc (process-live-p proc)))
+      (user-error "No running luaprobe session"))
+     (t
+      (with-current-buffer luaprobe--session-buffer
+        (goto-char (process-mark proc))
+        (let ((inhibit-read-only t))
+          (insert cmd))
+        (comint-send-input))))))
+
+(defun luaprobe-locals-continue () "Resume target." (interactive) (luaprobe--send "c"))
+(defun luaprobe-locals-step ()     "Step into."    (interactive) (luaprobe--send "s"))
+(defun luaprobe-locals-next ()     "Step over."    (interactive) (luaprobe--send "n"))
+(defun luaprobe-locals-finish ()   "Step out."     (interactive) (luaprobe--send "f"))
+(defun luaprobe-locals-bt ()       "Backtrace."    (interactive) (luaprobe--send "bt"))
+(defun luaprobe-locals-quit-target () "Kill target." (interactive)
+       (when (yes-or-no-p "Kill the running luaprobe target? ")
+         (luaprobe--send "q")))
+
+(defun luaprobe-locals-jump-to-frame ()
+  "RET on a frame line: select that frame and jump to its source.
+Sends `frame N' to the comint so subsequent `locals'/`p'/`e'
+commands run in that frame."
+  (interactive)
+  (let ((frame (get-text-property (line-beginning-position) 'luaprobe-frame)))
+    (cond
+     ((null frame) (user-error "Not on a frame"))
+     ((string-prefix-p "=[C]" (or (plist-get frame :file) ""))
+      (user-error "C frame — no source available"))
+     (t
+      (luaprobe--show-paused (plist-get frame :file) (plist-get frame :line))
+      (luaprobe--send (format "frame %d" (plist-get frame :idx)))))))
+
+(defun luaprobe-locals-next-frame ()
+  "Move point to the next frame line."
+  (interactive)
+  (let ((start (point)))
+    (forward-line 1)
+    (while (and (not (eobp))
+                (not (get-text-property (line-beginning-position)
+                                        'luaprobe-frame)))
+      (forward-line 1))
+    (unless (get-text-property (line-beginning-position) 'luaprobe-frame)
+      (goto-char start))))
+
+(defun luaprobe-locals-prev-frame ()
+  "Move point to the previous frame line."
+  (interactive)
+  (let ((start (point)))
+    (forward-line -1)
+    (while (and (not (bobp))
+                (not (get-text-property (line-beginning-position)
+                                        'luaprobe-frame)))
+      (forward-line -1))
+    (unless (get-text-property (line-beginning-position) 'luaprobe-frame)
+      (goto-char start))))
+
+(defun luaprobe-locals-mouse-jump (event)
+  "Mouse-1: jump to the frame at click position EVENT."
+  (interactive "e")
+  (mouse-set-point event)
+  (when (get-text-property (line-beginning-position) 'luaprobe-frame)
+    (luaprobe-locals-jump-to-frame)))
+
+(defvar luaprobe-locals-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "RET")     #'luaprobe-locals-jump-to-frame)
+    (define-key m (kbd "TAB")     #'luaprobe-locals-jump-to-frame)
+    (define-key m (kbd "n")       #'luaprobe-locals-next-frame)
+    (define-key m (kbd "p")       #'luaprobe-locals-prev-frame)
+    (define-key m (kbd "<down>")  #'luaprobe-locals-next-frame)
+    (define-key m (kbd "<up>")    #'luaprobe-locals-prev-frame)
+    (define-key m (kbd "c")       #'luaprobe-locals-continue)
+    (define-key m (kbd "s")       #'luaprobe-locals-step)
+    (define-key m (kbd "N")       #'luaprobe-locals-next)
+    (define-key m (kbd "f")       #'luaprobe-locals-finish)
+    (define-key m (kbd "?")       #'luaprobe-help)
+    (define-key m (kbd "q")       #'quit-window)
+    (define-key m [mouse-1]       #'luaprobe-locals-mouse-jump)
+    m)
+  "Keymap for `luaprobe-locals-mode'.")
+
+(defun luaprobe--button (key label cmd)
+  "Render a header-line toolbar button.
+KEY is the keyboard letter, LABEL the caption, CMD the command."
+  (let ((s (format " [%s] %s " key label)))
+    (propertize
+     s
+     'face 'luaprobe-locals-button-face
+     'mouse-face 'mode-line-highlight
+     'help-echo (format "%s — bound to %s" label key)
+     'keymap (let ((m (make-sparse-keymap)))
+               (define-key m [header-line mouse-1]
+                 (lambda () (interactive) (call-interactively cmd)))
+               m))))
+
+(defun luaprobe--locals-header-line ()
+  "Toolbar header-line for *luaprobe-locals*."
+  (concat
+   (luaprobe--button "c" "cont"   #'luaprobe-locals-continue)   " "
+   (luaprobe--button "s" "step"   #'luaprobe-locals-step)       " "
+   (luaprobe--button "N" "next"   #'luaprobe-locals-next)       " "
+   (luaprobe--button "f" "finish" #'luaprobe-locals-finish)     "  "
+   (luaprobe--button "?" "help"   #'luaprobe-help)              " "
+   (luaprobe--button "q" "hide"   #'quit-window)))
+
+(define-derived-mode luaprobe-locals-mode special-mode "luaprobe-locals"
+  "Major mode for the *luaprobe-locals* buffer."
+  (setq-local truncate-lines t)
+  (setq-local cursor-in-non-selected-windows t)
+  (setq-local header-line-format '(:eval (luaprobe--locals-header-line))))
+
+(defun luaprobe--render-break (event)
+  "Render parsed break EVENT into the *luaprobe-locals* buffer."
+  (let ((buf (get-buffer-create "*luaprobe-locals*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'luaprobe-locals-mode)
+        (luaprobe-locals-mode))
+      (setq luaprobe--current-event event)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        ;; Pause banner.
+        (insert (propertize
+                 (format "PAUSED  %s:%d  [%s]  (%s)"
+                         (or (and (plist-get event :file)
+                                  (file-name-nondirectory
+                                   (plist-get event :file)))
+                             "?")
+                         (or (plist-get event :line) 0)
+                         (or (plist-get event :thread) "?")
+                         (or (plist-get event :reason) "?"))
+                 'face 'luaprobe-locals-header-face))
+        (insert "\n")
+        (when (plist-get event :created-src)
+          (insert (propertize
+                   (format "  coroutine created at %s:%d\n"
+                           (plist-get event :created-src)
+                           (plist-get event :created-line))
+                   'face 'luaprobe-locals-section-face)))
+        (insert "\n")
+        ;; Frames.
+        (insert (propertize "frames" 'face 'luaprobe-locals-section-face)
+                "  "
+                (propertize "(RET to jump / select frame)"
+                            'face 'shadow)
+                "\n")
+        (dolist (f (plist-get event :frames))
+          (let* ((cur   (plist-get f :current))
+                 (face  (if cur 'luaprobe-locals-current-face
+                          'luaprobe-locals-frame-face))
+                 (line  (format "  %s#%-2d  %-26s %s:%d"
+                                (if cur "▸ " "  ")
+                                (plist-get f :idx)
+                                (plist-get f :name)
+                                (plist-get f :file)
+                                (plist-get f :line))))
+            (insert (propertize line
+                                'face face
+                                'luaprobe-frame f
+                                'mouse-face 'highlight))
+            (insert "\n")))
+        (insert "\n")
+        ;; Variable sections.
+        (dolist (kv '((:locals   . "locals")
+                      (:upvalues . "upvalues")
+                      (:entry    . "entry (at function entry)")))
+          (let ((vars (plist-get event (car kv))))
+            (when (and vars (> (length vars) 0))
+              (insert (propertize (cdr kv)
+                                  'face 'luaprobe-locals-section-face)
+                      "\n")
+              (dolist (v vars)
+                (insert "  "
+                        (propertize (plist-get v :name)
+                                    'face 'luaprobe-locals-name-face)
+                        " = "
+                        (or (plist-get v :value) "")
+                        "\n"))
+              (insert "\n"))))
+        (goto-char (point-min)))
+      (display-buffer buf
+                      `((display-buffer-reuse-window
+                         display-buffer-in-side-window)
+                        (side . right)
+                        (window-width . ,luaprobe-locals-window-width)
+                        (slot . 0))))))
 
 (defun luaprobe--clear-paused-overlay ()
   "Remove the highlight on the previously-paused source line."
@@ -603,12 +923,19 @@ Falls back to FILE as-is if nothing matches."
         file))))
 
 (defun luaprobe--show-paused (file line)
-  "Display FILE at LINE in another window and highlight the paused line."
+  "Display FILE at LINE and highlight the paused line.
+Reuses an existing window already showing the buffer instead of
+opening a duplicate."
   (let* ((resolved (luaprobe--resolve-source file))
          (buf (and resolved (find-file-noselect resolved))))
     (unless buf (user-error "Cannot open %s" file))
-    (let ((win (display-buffer buf '(display-buffer-use-some-window
-                                     (inhibit-same-window . t)))))
+    (let ((win (or (get-buffer-window buf 'visible)
+                   (display-buffer
+                    buf
+                    '((display-buffer-reuse-window
+                       display-buffer-use-some-window)
+                      (inhibit-same-window . t)
+                      (reusable-frames . visible))))))
       (when win
         (with-selected-window win
           (goto-char (point-min))
@@ -627,10 +954,11 @@ Falls back to FILE as-is if nothing matches."
 
 (define-derived-mode luaprobe-comint-mode comint-mode "luaprobe"
   "Comint mode for the *luaprobe* session buffer.
-Adds an output filter that jumps the source window to LuaProbe's
-pause location."
+Adds an output filter that parses break events and renders them
+into the *luaprobe-locals* side buffer."
   (setq-local comint-prompt-regexp luaprobe-comint-prompt-regexp)
   (setq-local comint-prompt-read-only nil)
+  (setq-local luaprobe--accum "")
   (add-hook 'comint-preoutput-filter-functions
             #'luaprobe--comint-output-filter nil t))
 
