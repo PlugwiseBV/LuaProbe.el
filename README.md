@@ -1,133 +1,162 @@
-# pwdebug.el
+# LuaProbe.el
 
-Emacs front-end for the [pwdebug](https://github.com/PlugwiseBV/pwdebug)
+Emacs front-end for the [LuaProbe](https://github.com/PlugwiseBV/LuaProbe)
 Lua debugger.
 
-Set conditional breakpoints from your Lua source buffers, drill into
-the paused target's tables interactively, and step with the keys you
-already know from gdb / lldb.
-
-![paused](docs/screenshot-paused.png)
+Set persistent breakpoints (plain, log-only, conditional) from your
+Lua source buffers, launch your project under LuaProbe with one
+command, and have the source window auto-jump to the line LuaProbe
+pauses on.
 
 ## What this package does
 
-- Adds **fringe markers** for breakpoints (●) and info-points (◆) in
-  any Lua buffer where you enable `pwdebug-mode`.
-- **Persists points** to `~/.config/pwdebug/debug_points.lua`, the
-  same file the pwdebug TUI reads — set a breakpoint here, it works
-  there, and vice-versa.
-- Renders the live pause snapshot from the runtime as an interactive
-  **value tree** in a side window: frames, args, locals, upvalues,
-  per-function `_ENV`, `_G`. Tables are collapsible — `RET` / `TAB`
-  expands; the runtime is asked on demand for tables that weren't
-  captured at pause time.
-- Cycle-safe: a table that contains itself terminates with `↺`
-  instead of recursing forever.
-- **Conditional breakpoints**: pause only when a Lua expression is
-  truthy, evaluated against the current locals / upvalues / globals.
-  The condition is rendered above the source line as a faded fake
-  line (`╎ IF user.id == 5`).
-- **Info-points**: capture a snapshot + evaluated expression value
-  without ever pausing the target — useful for tracing.
-- **gdb-style stepping**: continue, step-into, step-over, step-out.
+- Adds **fringe markers** for breakpoints (●) and log-only points
+  (◆) in any Lua buffer where you enable `luaprobe-mode`.
+- **Persists points** across sessions in
+  `~/.config/luaprobe/breakpoints.lua`. On launch, enabled points
+  are converted to LuaProbe spec syntax (`FILE:LINE[!] [if EXPR]`)
+  and passed via `-b` flags to `bin/luaprobe`.
+- **Conditional breakpoints**: the runtime evaluates a Lua
+  expression against the current locals / upvalues / globals at
+  hit time and only pauses when truthy. The condition is shown
+  inline above the source line as a faded fake line
+  (`╎ IF user.id == 5`).
+- **Log-only breakpoints**: don't pause; LuaProbe writes the break
+  event and the program keeps running. Inline annotation `╎ LOG`.
+- **`luaprobe-install`**: one-time clone of the LuaProbe Lua repo.
+- **`luaprobe-launch`**: spawns `bin/luaprobe` with the right
+  arguments in a comint buffer; the gdb-style `(luaprobe)` REPL is
+  available for `c` / `s` / `n` / `f` / `b` / `d` / `bt` / `e` /
+  `p` etc. The source window auto-jumps when the target pauses.
 
 ## Installation
-
-The package depends on the pwdebug Lua runtime — it only does
-anything useful when the target Lua process has been launched with
-`LUA_INIT="@.../src/dbg_runtime.lua"`. See the pwdebug project for
-how to set that up.
 
 ### From MELPA *(once published)*
 
 ```elisp
-(use-package pwdebug
-  :hook (lua-mode . pwdebug-enable-here)
-  :bind-keymap ("C-c d" . pwdebug-prefix-map))
+(use-package luaprobe
+  :hook (lua-mode . luaprobe-mode)
+  :bind-keymap ("C-c d" . luaprobe-prefix-map))
 ```
 
 ### Manual
 
-Clone this repo and add it to your `load-path`:
-
 ```elisp
-(add-to-list 'load-path "/path/to/pwdebug.el")
-(require 'pwdebug)
-(add-hook 'lua-mode-hook #'pwdebug-enable-here)
-(global-set-key (kbd "C-c d") pwdebug-prefix-map)
+(add-to-list 'load-path "/path/to/LuaProbe.el")
+(require 'luaprobe)
+(add-hook 'lua-mode-hook #'luaprobe-mode)
+(global-set-key (kbd "C-c d") luaprobe-prefix-map)
 ```
 
-`pwdebug-prefix-map` is **not bound by default**: Emacs reserves
+`luaprobe-prefix-map` is **not bound by default**: Emacs reserves
 `C-c LETTER` sequences for user customisations, so the package
-ships the keymap as a free-standing variable for you to bind on
-your own prefix.
+ships the keymap as a free-standing variable for you to bind.
+
+### Then bring in the LuaProbe Lua tool
+
+```
+M-x luaprobe-install
+```
+
+Clones https://github.com/PlugwiseBV/LuaProbe into
+`~/.local/share/luaprobe` (overridable via `luaprobe-install-dir`).
+With a prefix arg, runs `git pull` to update an existing clone.
+
+## Usage
+
+1. Open a Lua source buffer; turn on `luaprobe-mode`.
+2. Move point to a line and press `C-c d b` to set a breakpoint.
+   For a conditional one, `C-u C-c d b` and type the Lua condition.
+   For a log-only one, `C-c d L`.
+3. `M-x luaprobe-launch` (or `C-c d r`) — pick a Lua file (defaults
+   to the current buffer) and any extra args. A `*luaprobe*` comint
+   buffer pops up; the target runs under LuaProbe with your
+   breakpoints loaded.
+4. When the target pauses, the source window auto-jumps to the
+   line. Type `c` / `s` / `n` / `f` at the `(luaprobe)` prompt to
+   continue / step into / step over / finish.
 
 ## Configuration
 
-`pwdebug-enable-here` only turns the minor mode on for files under
-the `pwcore_root` configured in `~/.config/pwdebug/config.lua`. If
-you want the mode in every Lua buffer instead, just add `pwdebug-mode`
-to `lua-mode-hook` directly.
-
 | variable                    | default                                      |
 |-----------------------------|----------------------------------------------|
-| `pwdebug-points-file`       | `~/.config/pwdebug/debug_points.lua`         |
-| `pwdebug-config-file`       | `~/.config/pwdebug/config.lua`               |
-| `pwdebug-snapshot-file`     | `/tmp/pwdebug/snapshot.json`                 |
-| `pwdebug-state-file`        | `/tmp/pwdebug/state`                         |
-| `pwdebug-cmd-file`          | `/tmp/pwdebug/cmd`                           |
-| `pwdebug-poll-interval`     | `0.5` seconds                                |
-| `pwdebug-locals-window-width` | `60` columns                               |
+| `luaprobe-points-file`      | `~/.config/luaprobe/breakpoints.lua`         |
+| `luaprobe-install-dir`      | `~/.local/share/luaprobe`                    |
+| `luaprobe-repo-url`         | `https://github.com/PlugwiseBV/LuaProbe`     |
+| `luaprobe-lua-program`      | `"lua5.1"`                                   |
+| `luaprobe-source-dirs`      | `'(".")`                                     |
+| `luaprobe-jump-on-pause`    | `t`                                          |
+
+`luaprobe-source-dirs` becomes `-s DIR` arguments to `bin/luaprobe`,
+which it uses to resolve relative source paths in break events.
 
 ## Key bindings
 
-In any Lua buffer with `pwdebug-mode` on:
+In any Lua buffer with `luaprobe-mode` on (under `C-c d` if you
+bound it as recommended):
 
-| key            | command                                      |
+| key       | command                                          |
+|-----------|--------------------------------------------------|
+| `b`       | toggle plain breakpoint                          |
+| `C-u b`   | toggle CONDITIONAL breakpoint (prompts)          |
+| `B`       | set / replace the condition on this line         |
+| `L`       | toggle log-only breakpoint                       |
+| `e`       | edit the condition on the point at point         |
+| `t`       | toggle enabled / disabled                        |
+| `l`       | list every configured point                      |
+| `C`       | clear ALL points                                 |
+| `r`       | run (alias for `M-x luaprobe-launch`)            |
+| `I`       | install / update the LuaProbe Lua repo           |
+| `?` / `h` | full help popup                                  |
+
+In the `*luaprobe*` comint buffer (these are LuaProbe REPL commands,
+not Emacs bindings — see `bin/luaprobe --help`):
+
+| key            | meaning                                      |
 |----------------|----------------------------------------------|
-| `C-c d b`      | toggle plain breakpoint                      |
-| `C-u C-c d b`  | toggle CONDITIONAL breakpoint (prompts)      |
-| `C-c d B`      | set / replace the condition on this line     |
-| `C-c d i`      | toggle info-point (prompts for expression)   |
-| `C-c d e`      | edit the expression on the point at point    |
-| `C-c d l`      | pop up the list of all configured points     |
-| `C-c d C`      | clear ALL points                             |
-| `C-c d c/s/n/f`| continue / step in / step over / finish      |
-| `C-c d ?`      | full help popup                              |
+| `c`            | continue                                     |
+| `s`            | step into                                    |
+| `n`            | step over                                    |
+| `f`            | finish (step out)                            |
+| `bt`           | backtrace                                    |
+| `l [N]`        | list source                                  |
+| `locals`       | show locals + upvalues                       |
+| `p NAME`       | deep-inspect a variable                      |
+| `e EXPR`       | evaluate Lua expression in the current frame |
+| `frame N`      | select stack frame N                         |
+| `b FILE:L[!]…` | add breakpoint at runtime                    |
+| `d FILE:L`     | delete breakpoint at runtime                 |
+| `bps`          | list breakpoints                             |
+| `q`            | quit (kills the target)                      |
 
-In `*pwdebug-locals*` (when paused):
+## How it fits together
 
-| key             | command                                     |
-|-----------------|---------------------------------------------|
-| `RET` / `TAB`   | expand / collapse (or jump to source on a frame) |
-| `+` / `→`       | expand only                                 |
-| `-` / `←`       | collapse only / step up to parent           |
-| `j` / `↓`       | next row                                    |
-| `k` / `↑`       | previous row                                |
-| `M-n` / `M-p`   | next / previous stack frame                 |
-| `c`             | continue                                    |
-| `s`             | step into                                   |
-| `n`             | step over                                   |
-| `f`             | finish (step out)                           |
-| `g`             | refresh from snapshot file                  |
-| `?`             | help                                        |
-| `q`             | hide the locals window                      |
-
-## How conditional breakpoints work
-
-When a breakpoint has a non-empty `expr`, the runtime builds an
-environment from the user frame's **locals** + **upvalues** at the
-breakpoint line (with `_G` as fallback), evaluates the expression
-via `loadstring("return " .. expr)`, and only pauses when the
-result is truthy. Errors in the expression also pause (so you can
-see the error message in the locals view) — they don't silently
-hide a misconfigured condition.
+```
+┌──────────────────────────┐                    ┌────────────────────────┐
+│ Emacs (luaprobe.el)      │                    │ bin/luaprobe (LuaJIT)  │
+│  • point persistence     │  comint stdin/out  │  • controller library  │
+│  • fringe markers        │ ←────────────────→ │  • two FIFOs to child  │
+│  • condition fake-lines  │                    │  • REPL                │
+│  • auto-jump on *** BREAK│                    │                        │
+└──────────────────────────┘                    └────────────────────────┘
+                                                            │ FIFOs
+                                                            ▼
+                                               ┌────────────────────────┐
+                                               │ target process (lua5.1)│
+                                               │  + luaprobe_stub.lua   │
+                                               │    via LUA_INIT        │
+                                               └────────────────────────┘
+```
 
 ## Roadmap
 
-- Optional `tree-widget` rendering of the value tree
-- Persistent expansion state across runs
-- `pwdebug-eval-region` for ad-hoc evaluation in the paused frame
+- Replace the comint REPL with a structured break-event handler:
+  parse the JSON-style break events from a small bridge script
+  and render frames + locals + upvalues as a collapsible tree
+  (similar to gud / dap-mode), with `inspect` for deep dumps.
+- Persistent expansion state across pauses.
+- `luaprobe-eval-region` to send the region as `e` to the running
+  session.
 
 ## License
 
