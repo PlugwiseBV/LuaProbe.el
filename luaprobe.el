@@ -707,18 +707,27 @@ Always returns OUTPUT unchanged."
         (setq event (plist-put event :created-src  (match-string 1)))
         (setq event (plist-put event :created-line
                                (string-to-number (match-string 2)))))
+      ;; Collect frames as a CONTIGUOUS BLOCK right after the BREAK
+      ;; header (and the optional "coroutine created at" line).  Doing
+      ;; this with a global re-search-forward would also match the
+      ;; "  #1   suspended  thread:..." entries in the coroutines list,
+      ;; which look superficially similar.
       (goto-char (point-min))
-      (while (re-search-forward
-              (concat "^\\([* ]\\) #\\([0-9]+\\)  "
-                      "\\(.+?\\)  +"
-                      "\\(.+?\\):\\(-?[0-9]+\\)\\s-*$")
-              nil t)
-        (push (list :idx     (string-to-number (match-string 2))
-                    :name    (string-trim (match-string 3))
-                    :file    (match-string 4)
-                    :line    (string-to-number (match-string 5))
-                    :current (string= (match-string 1) "*"))
-              frames))
+      (when (re-search-forward "^\\*\\*\\* BREAK at" nil t)
+        (forward-line 1)
+        (when (looking-at "^    coroutine created at")
+          (forward-line 1))
+        (while (looking-at
+                (concat "^\\([* ]\\) #\\([0-9]+\\)  "
+                        "\\(.+?\\)  +"
+                        "\\(.+?\\):\\(-?[0-9]+\\)\\s-*$"))
+          (push (list :idx     (string-to-number (match-string 2))
+                      :name    (string-trim (match-string 3))
+                      :file    (match-string 4)
+                      :line    (string-to-number (match-string 5))
+                      :current (string= (match-string 1) "*"))
+                frames)
+          (forward-line 1)))
       (when event (setq event (plist-put event :frames (nreverse frames))))
       ;; Sections.
       (dolist (kv '((:locals   . "^locals:$")
@@ -735,6 +744,33 @@ Always returns OUTPUT unchanged."
               (forward-line 1))
             (when event
               (setq event (plist-put event (car kv) (nreverse vars)))))))
+      ;; Coroutines section emitted by bin/luaprobe:
+      ;;   coroutines (N live):
+      ;;     #1   suspended  thread: 0x...   created FILE:LINE   at FILE:LINE
+      (goto-char (point-min))
+      (when (re-search-forward "^coroutines (\\([0-9]+\\) live):$" nil t)
+        (forward-line 1)
+        (let (coros)
+          (while (looking-at
+                  (concat "^  #\\([0-9]+\\) +"
+                          "\\([a-z]+\\) +"
+                          "\\(thread: \\S-+\\) +"
+                          "created \\(\\S-+\\):\\([0-9]+\\)"
+                          "\\(?: +at \\(\\S-+\\):\\(-?[0-9]+\\)\\)?"))
+            (push (list :idx     (string-to-number (match-string 1))
+                        :status  (match-string 2)
+                        :id      (match-string 3)
+                        :created (format "%s:%s"
+                                         (match-string 4)
+                                         (match-string 5))
+                        :top     (and (match-string 6)
+                                      (format "%s:%s"
+                                              (match-string 6)
+                                              (match-string 7))))
+                  coros)
+            (forward-line 1))
+          (when (and event coros)
+            (setq event (plist-put event :coroutines (nreverse coros))))))
       event)))
 
 ;; ----- *luaprobe-locals* buffer ---------------------------------------
@@ -928,33 +964,28 @@ KEY is the keyboard letter, LABEL the caption, CMD the command."
                                 'mouse-face 'highlight))
             (insert "\n")))
         (insert "\n")
-        ;; Coroutines visible in the current frame.  LuaProbe's
-        ;; wire protocol opaquifies coroutine values to "<thread>",
-        ;; so we can only point at where they live in scope; query
-        ;; live status with `e coroutine.status(NAME)' in the REPL.
-        (let (coros)
-          (dolist (kv '((:locals . "local")
-                        (:upvalues . "upvalue")
-                        (:entry . "entry")))
-            (dolist (v (plist-get event (car kv)))
-              (when (and (plist-get v :value)
-                         (string-match-p "\"<thread>\""
-                                         (plist-get v :value)))
-                (push (list :name (plist-get v :name) :kind (cdr kv))
-                      coros))))
-          (when coros
-            (insert (propertize "coroutines in scope"
-                                'face 'luaprobe-locals-section-face)
-                    "  "
-                    (propertize "(`o' then `e coroutine.status(NAME)')"
-                                'face 'shadow)
+        ;; Live coroutines (other than the one we're paused in).
+        ;; LuaProbe's stub now emits this list on every break; bin/luaprobe
+        ;; prints it after `locals' / `upvalues' as
+        ;;   coroutines (N live):
+        ;;     #1   suspended   thread: 0x...   created FILE:LINE   at FILE:LINE
+        (let ((coros (plist-get event :coroutines)))
+          (when (and coros (> (length coros) 0))
+            (insert (propertize
+                     (format "coroutines (%d live)" (length coros))
+                     'face 'luaprobe-locals-section-face)
                     "\n")
-            (dolist (c (nreverse coros))
-              (insert (format "  %s   %s\n"
-                              (propertize (plist-get c :name)
-                                          'face 'luaprobe-locals-name-face)
-                              (propertize (concat "(" (plist-get c :kind) ")")
-                                          'face 'shadow))))
+            (dolist (c coros)
+              (insert (format "  #%-2d  %-9s  %s\n"
+                              (plist-get c :idx)
+                              (propertize (plist-get c :status)
+                                          'face 'luaprobe-locals-section-face)
+                              (propertize (or (plist-get c :created) "?")
+                                          'face 'shadow)))
+              (when (plist-get c :top)
+                (insert (format "       at %s\n"
+                                (propertize (plist-get c :top)
+                                            'face 'shadow)))))
             (insert "\n")))
         ;; Variable sections.
         (dolist (kv '((:locals   . "locals")
