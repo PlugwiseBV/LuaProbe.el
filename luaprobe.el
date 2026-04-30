@@ -743,7 +743,11 @@ Always returns OUTPUT unchanged."
   "Last parsed break event rendered in this buffer.")
 
 (defun luaprobe--send (cmd)
-  "Send CMD as a line to the running *luaprobe* comint process."
+  "Send CMD as a line to the running *luaprobe* comint process.
+Uses `process-send-string' rather than `comint-send-input' so the
+write works whether or not the *luaprobe* buffer is currently
+displayed.  Also echoes CMD into the comint buffer so the input
+shows up if the user later pops it open with `o'."
   (let ((proc (and (bufferp luaprobe--session-buffer)
                    (buffer-live-p luaprobe--session-buffer)
                    (get-buffer-process luaprobe--session-buffer))))
@@ -751,11 +755,14 @@ Always returns OUTPUT unchanged."
      ((not (and proc (process-live-p proc)))
       (user-error "No running luaprobe session"))
      (t
+      ;; Echo the input into the buffer for history.
       (with-current-buffer luaprobe--session-buffer
-        (goto-char (process-mark proc))
         (let ((inhibit-read-only t))
-          (insert cmd))
-        (comint-send-input))))))
+          (goto-char (process-mark proc))
+          (insert cmd "\n")
+          (set-marker (process-mark proc) (point))))
+      ;; Actually send to the process.
+      (process-send-string proc (concat cmd "\n"))))))
 
 (defun luaprobe-locals-continue () "Resume target." (interactive) (luaprobe--send "c"))
 (defun luaprobe-locals-step ()     "Step into."    (interactive) (luaprobe--send "s"))
@@ -921,6 +928,34 @@ KEY is the keyboard letter, LABEL the caption, CMD the command."
                                 'mouse-face 'highlight))
             (insert "\n")))
         (insert "\n")
+        ;; Coroutines visible in the current frame.  LuaProbe's
+        ;; wire protocol opaquifies coroutine values to "<thread>",
+        ;; so we can only point at where they live in scope; query
+        ;; live status with `e coroutine.status(NAME)' in the REPL.
+        (let (coros)
+          (dolist (kv '((:locals . "local")
+                        (:upvalues . "upvalue")
+                        (:entry . "entry")))
+            (dolist (v (plist-get event (car kv)))
+              (when (and (plist-get v :value)
+                         (string-match-p "\"<thread>\""
+                                         (plist-get v :value)))
+                (push (list :name (plist-get v :name) :kind (cdr kv))
+                      coros))))
+          (when coros
+            (insert (propertize "coroutines in scope"
+                                'face 'luaprobe-locals-section-face)
+                    "  "
+                    (propertize "(`o' then `e coroutine.status(NAME)')"
+                                'face 'shadow)
+                    "\n")
+            (dolist (c (nreverse coros))
+              (insert (format "  %s   %s\n"
+                              (propertize (plist-get c :name)
+                                          'face 'luaprobe-locals-name-face)
+                              (propertize (concat "(" (plist-get c :kind) ")")
+                                          'face 'shadow))))
+            (insert "\n")))
         ;; Variable sections.
         (dolist (kv '((:locals   . "locals")
                       (:upvalues . "upvalues")
