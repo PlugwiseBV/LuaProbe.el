@@ -6,7 +6,8 @@ Lua debugger.
 Set persistent breakpoints (plain, log-only, conditional) from your
 Lua source buffers, launch your project under LuaProbe with one
 command, and have the source window auto-jump to the line LuaProbe
-pauses on.
+pauses on — whether driven from inside Emacs or from an external TUI
+like pwdebug.
 
 ## What this package does
 
@@ -28,6 +29,10 @@ pauses on.
   arguments in a comint buffer; the gdb-style `(luaprobe)` REPL is
   available for `c` / `s` / `n` / `f` / `b` / `d` / `bt` / `e` /
   `p` etc. The source window auto-jumps when the target pauses.
+- **External pause-beacon watcher**: when an external driver (e.g.
+  the pwdebug TUI) writes `luaprobe-paused-file`, Emacs instantly
+  jumps the source window to the paused location — no in-Emacs
+  launch required.
 
 ## Installation
 
@@ -73,14 +78,31 @@ With a prefix arg, runs `git pull` to update an existing clone.
    buffer pops up; the target runs under LuaProbe with your
    breakpoints loaded.
 4. When the target pauses, the source window auto-jumps to the
-   line. Type `c` / `s` / `n` / `f` at the `(luaprobe)` prompt to
+   paused line and `*luaprobe-locals*` opens on the right showing
+   the call stack, locals, upvalues, and coroutines.
+   Type `c` / `s` / `n` / `f` at the `(luaprobe)` prompt to
    continue / step into / step over / finish.
+
+### Using with an external TUI (pwdebug / headless)
+
+The pause-beacon watcher starts automatically when `luaprobe.el` is
+loaded. When an external driver writes `luaprobe-paused-file`
+(default `~/.config/luaprobe/paused.lua`) in the format:
+
+```lua
+file="path/to/source.lua", line=42
+```
+
+Emacs immediately jumps the source window to that location and
+highlights the paused line. When the file is deleted (on resume),
+the overlay is cleared. No `luaprobe-launch` is needed.
 
 ## Configuration
 
 | variable                    | default                                      |
 |-----------------------------|----------------------------------------------|
 | `luaprobe-points-file`      | `~/.config/luaprobe/breakpoints.lua`         |
+| `luaprobe-paused-file`      | `~/.config/luaprobe/paused.lua`              |
 | `luaprobe-install-dir`      | `~/.local/share/luaprobe`                    |
 | `luaprobe-repo-url`         | `https://github.com/PlugwiseBV/LuaProbe`     |
 | `luaprobe-lua-program`      | `"lua5.1"`                                   |
@@ -89,6 +111,9 @@ With a prefix arg, runs `git pull` to update an existing clone.
 
 `luaprobe-source-dirs` becomes `-s DIR` arguments to `bin/luaprobe`,
 which it uses to resolve relative source paths in break events.
+
+Set `luaprobe-paused-debug` to `t` to log every pause-beacon event
+to `*Messages*` for troubleshooting.
 
 ## Key bindings
 
@@ -108,6 +133,18 @@ bound it as recommended):
 | `r`       | run (alias for `M-x luaprobe-launch`)            |
 | `I`       | install / update the LuaProbe Lua repo           |
 | `?` / `h` | full help popup                                  |
+
+In the `*luaprobe-locals*` side buffer:
+
+| key       | action                                                       |
+|-----------|--------------------------------------------------------------|
+| `RET`     | on a **frame**: jump source window there + select that frame |
+| `RET`     | on a **variable**: jump to its declaration; if it is a function, choose `[f]` body or `[v]` declaration |
+| `RET`     | on a **coroutine**: jump to its top source location          |
+| `SPC`     | on a frame: select frame only (no source jump)               |
+| `TAB`     | on a variable with `▶`: expand / collapse inline table       |
+| `n` / `p` | navigate between items (frames, variables, coroutines)       |
+| `↑` / `↓` | move line by line                                            |
 
 In the `*luaprobe*` comint buffer (these are LuaProbe REPL commands,
 not Emacs bindings — see `bin/luaprobe --help`):
@@ -138,25 +175,15 @@ not Emacs bindings — see `bin/luaprobe --help`):
 │  • fringe markers        │ ←────────────────→ │  • two FIFOs to child  │
 │  • condition fake-lines  │                    │  • REPL                │
 │  • auto-jump on *** BREAK│                    │                        │
-└──────────────────────────┘                    └────────────────────────┘
-                                                            │ FIFOs
-                                                            ▼
-                                               ┌────────────────────────┐
-                                               │ target process (lua5.1)│
-                                               │  + luaprobe_stub.lua   │
-                                               │    via LUA_INIT        │
-                                               └────────────────────────┘
+│  • pause-beacon watcher  │                    └────────────────────────┘
+│    (external TUI support)│                                │ FIFOs
+└──────────────────────────┘                                ▼
+          ↑ file-notify                     ┌────────────────────────┐
+    paused.lua written                      │ target process (lua5.1)│
+    by external driver                      │  + luaprobe_stub.lua   │
+                                            │    via LUA_INIT        │
+                                            └────────────────────────┘
 ```
-
-## Roadmap
-
-- Replace the comint REPL with a structured break-event handler:
-  parse the JSON-style break events from a small bridge script
-  and render frames + locals + upvalues as a collapsible tree
-  (similar to gud / dap-mode), with `inspect` for deep dumps.
-- Persistent expansion state across pauses.
-- `luaprobe-eval-region` to send the region as `e` to the running
-  session.
 
 ## License
 
