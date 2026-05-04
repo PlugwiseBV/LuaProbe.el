@@ -1,5 +1,8 @@
 # LuaProbe.el
 
+<img width="1080" height="608" alt="simplescreenrecorder-2026-05-04_10 36 30" src="https://github.com/user-attachments/assets/61b86834-7afc-4e16-9a8e-13cb07f482ed" />
+
+
 Emacs front-end for the [LuaProbe](https://github.com/PlugwiseBV/LuaProbe)
 Lua debugger.
 
